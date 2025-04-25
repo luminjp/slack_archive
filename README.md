@@ -1,0 +1,2 @@
+# slack_archive
+SlackのチャンネルやDMをMarkDown形式でアーカイブ
