@@ -2,25 +2,16 @@
 """
 Slack Conversation Exporter Bot
 
-This Slack Bot: 
-  • Responds to `/export list` by listing channels, private channels, DMs, and group DMs.
-  • Responds to `/export archive <conversation_id>` by exporting history and files to Markdown,
-    zipping the result, and uploading the ZIP back to the channel.
+Dual-mode operation:
+  • Bot mode: pass `--bot` to run as a Slack slash-command bot (Socket Mode).
+  • CLI mode: list or archive via command-line arguments.
 
-Required OAuth scopes for the Bot Token:
-  • commands
-  • channels:read, groups:read, im:read, mpim:read
-  • chat:write
-  • files:write
-  • users:read
-
-Environment variables required:
-  SLACK_BOT_TOKEN
-  SLACK_APP_TOKEN        # for Socket Mode
-  SLACK_SIGNING_SECRET
-  # Optional: TIMEZONE (IANA name, default Asia/Tokyo)
+Bot mode: same OAuth scopes and env vars as before.
+CLI mode: requires SLACK_BOT_TOKEN or pass --token.
 """
 import os
+import sys
+import argparse
 import logging
 import tempfile
 import zipfile
@@ -45,13 +36,13 @@ try:
 except Exception:
     TZ = zoneinfo.ZoneInfo('Asia/Tokyo')
 
-# Initialize Bolt App with bot token and signing secret
+# Initialize Slack Bolt App for bot mode
 app = App(
     token=os.environ.get('SLACK_BOT_TOKEN'),
     signing_secret=os.environ.get('SLACK_SIGNING_SECRET')
 )
 
-# ---- Utility functions ----
+# ---- Shared utility functions ----
 
 def list_conversations(client: WebClient) -> list[str]:
     types = ["public_channel", "private_channel", "im", "mpim"]
@@ -112,7 +103,6 @@ def download_file(file_info: dict, token: str, dest_dir: str) -> str:
 
 
 def format_ts(ts: str) -> str:
-    """Convert Slack timestamp to formatted string in configured timezone"""
     try:
         sec = float(ts)
         dt = datetime.datetime.fromtimestamp(sec, TZ)
@@ -122,15 +112,13 @@ def format_ts(ts: str) -> str:
 
 
 def export_conversation(client: WebClient, conv_id: str, token: str, output_base: str) -> str:
-    """Fetch and export conversation messages to a Markdown file."""
     info = client.conversations_info(channel=conv_id)['channel']
-    # Auto-join if public channel and bot not in it
+    # Auto-join public channel if needed
     if info.get('is_channel') and not info.get('is_member'):
         try:
             client.conversations_join(channel=conv_id)
         except SlackApiError:
             pass
-
     conv_name = info.get('name') or conv_id
     date_str = datetime.date.today().strftime('%Y%m%d')
     out_dir = os.path.join(output_base, conv_name)
@@ -138,7 +126,7 @@ def export_conversation(client: WebClient, conv_id: str, token: str, output_base
     md_path = os.path.join(out_dir, f"{conv_name}_{date_str}.md")
     user_cache: dict[str, str] = {}
 
-    # Collect all messages
+    # Fetch and sort messages
     all_msgs = []
     cursor = None
     while True:
@@ -147,7 +135,6 @@ def export_conversation(client: WebClient, conv_id: str, token: str, output_base
         cursor = resp.get('response_metadata', {}).get('next_cursor')
         if not cursor:
             break
-    # Sort by timestamp ascending
     try:
         all_msgs.sort(key=lambda m: float(m.get('ts', 0)))
     except Exception:
@@ -167,10 +154,8 @@ def export_conversation(client: WebClient, conv_id: str, token: str, output_base
                     user_cache[uid] = uid
             uname = user_cache.get(uid, 'unknown')
             text = msg.get('text', '')
-            # Wrap code fences with blank lines
             text = re.sub(r'(?m)(^```)(?!\n)', '```\n', text)
             text = re.sub(r'(?m)(?<!\n)(```$)', '\n```', text)
-
             md.write(f"## {ts_fmt} — {uname} (<@{uid}>)\n\n{text}\n\n")
             for f in msg.get('files', []):
                 try:
@@ -178,10 +163,9 @@ def export_conversation(client: WebClient, conv_id: str, token: str, output_base
                     md.write(f"![{f['name']}]({os.path.basename(local)})\n\n")
                 except:
                     md.write(f"[Failed to download {f['name']}]\n\n")
+    return md_path
 
-    return out_dir
-
-# ---- Slash command handler ----
+# ---- Bot command handler ----
 @app.command("/export")
 def handle_export(ack, respond, command, client: WebClient, logger):
     ack()
@@ -198,15 +182,12 @@ def handle_export(ack, respond, command, client: WebClient, logger):
         respond(f"Archiving conversation `{conv}`... this may take a while.")
         with tempfile.TemporaryDirectory() as tmp:
             try:
-                out_dir = export_conversation(client, conv, os.environ.get('SLACK_BOT_TOKEN'), tmp)
+                md_path = export_conversation(client, conv, os.environ.get('SLACK_BOT_TOKEN'), tmp)
                 zip_path = os.path.join(tmp, f"{conv}.zip")
                 with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                    for root, _, files in os.walk(out_dir):
+                    for root, _, files in os.walk(os.path.dirname(md_path)):
                         for file in files:
-                            zipf.write(
-                                os.path.join(root, file),
-                                arcname=os.path.relpath(os.path.join(root, file), out_dir)
-                            )
+                            zipf.write(os.path.join(root, file), arcname=file)
                 client.files_upload_v2(
                     channels=[command['channel_id']],
                     file=zip_path,
@@ -214,19 +195,41 @@ def handle_export(ack, respond, command, client: WebClient, logger):
                     title=f"Archive_{conv}",
                     initial_comment=f"Here is the archived export for `{conv}`."
                 )
-            except SlackApiError as e:
-                if e.response['error'] == 'method_deprecated':
-                    respond("Upload method is deprecated. Please ensure your app has the `files:write` scope and try again.")
-                else:
-                    logger.error(e)
-                    respond(f"Failed to archive `{conv}`: {e.response['error']}")
             except Exception as e:
                 logger.error(e)
                 respond(f"Failed to archive `{conv}`: {e}")
     else:
-        respond("Invalid subcommand. Use `list` or `archive <conversation_id>`.")
+        respond("Invalid subcommand. Use `list` or `archive <conversation_id>`." )
+
+# ---- CLI entry point ----
+def cli_main():
+    parser = argparse.ArgumentParser(description='Export Slack conversations to Markdown')
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--list', action='store_true', help='List available conversations')
+    group.add_argument('--archive', nargs='+', metavar='CONV_ID', help='Archive conversation(s)')
+    parser.add_argument('--output-dir', default='exports', help='Directory to save exports')
+    parser.add_argument('--token', default=os.environ.get('SLACK_BOT_TOKEN'), help='Slack bot token')
+    args = parser.parse_args()
+    if not args.token:
+        print('Error: Slack token required via --token or SLACK_BOT_TOKEN')
+        sys.exit(1)
+    client = WebClient(token=args.token)
+    if args.list:
+        for line in list_conversations(client):
+            print(line)
+    else:
+        for conv in args.archive:
+            try:
+                md_path = export_conversation(client, conv, args.token, args.output_dir)
+                print(f"Exported {conv} to {md_path}")
+            except Exception as e:
+                print(f"Failed to export {conv}: {e}")
 
 # ---- App start ----
-if __name__ == "__main__":
-    handler = SocketModeHandler(app, os.environ.get('SLACK_APP_TOKEN'))
-    handler.start()
+if __name__ == '__main__':
+    if '--bot' in sys.argv:
+        sys.argv.remove('--bot')
+        handler = SocketModeHandler(app, os.environ.get('SLACK_APP_TOKEN'))
+        handler.start()
+    else:
+        cli_main()
